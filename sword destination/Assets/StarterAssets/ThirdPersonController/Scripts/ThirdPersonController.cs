@@ -76,6 +76,8 @@ namespace StarterAssets
         [Header("Attack (optional)")]
         [Tooltip("Jika diisi, controller akan langsung cross-fade / play ke state animator ini (format: 'StateName' atau 'LayerName.StateName' tergantung animator).")]
         public string AttackStateName = ""; // kosong = gunakan parameter Animator (Trigger/Bool)
+        public int AttackLayer = 1; // layer untuk memainkan anim attack (buat layer khusus di Animator, default 1)
+        private int _attackStateHash = 0;
 
         // cinemachine
         private float _cinemachineTargetYaw;
@@ -150,6 +152,18 @@ namespace StarterAssets
 
             AssignAnimationIDs();
             DetectAttackParameterType();
+
+            // compute attack state short name hash if AttackStateName provided
+            if (!string.IsNullOrEmpty(AttackStateName) && _animator != null)
+            {
+                string shortName = AttackStateName;
+                if (AttackStateName.Contains("."))
+                {
+                    var parts = AttackStateName.Split('.');
+                    shortName = parts[parts.Length - 1];
+                }
+                _attackStateHash = Animator.StringToHash(shortName);
+            }
 
 #if ENABLE_INPUT_SYSTEM 
             _playerInput = GetComponent<PlayerInput>();
@@ -248,71 +262,119 @@ namespace StarterAssets
         private void TriggerAttack()
         {
             if (!_hasAnimator || _animator == null) return;
-
             if (_isAttacking) return; // block double-trigger
 
-            // jika user menyetkan nama state attack, play langsung tanpa transisi panjang
-            if (!string.IsNullOrEmpty(AttackStateName))
+            _isAttacking = true;
+
+            // ensure speed/motion are zero so "Speed < 0.01" condition is satisfied
+            _animator.SetFloat(_animIDSpeed, 0f);
+            _animator.SetFloat(_animIDMotionSpeed, 0f);
+            _animator.SetBool(_animIDGrounded, true);
+
+            if (!string.IsNullOrEmpty(AttackStateName) && _attackStateHash != 0)
             {
-                _isAttacking = true;
-                _animator.Play(AttackStateName, 0, 0.0f);
-                StartCoroutine(WaitForAttackEnd(resetBool:false));
+                // Play on dedicated layer to avoid other layer transitions interrupting
+                _animator.Play(AttackStateName, AttackLayer, 0f);
+                StartCoroutine(WaitForAttackEnd(resetBool:false, layerIndex:AttackLayer, targetStateHash:_attackStateHash));
                 return;
             }
 
             if (_useAttackTrigger)
             {
-                _isAttacking = true;
                 _animator.ResetTrigger(_animIDAttackTrigger);
                 _animator.SetTrigger(_animIDAttackTrigger);
-                StartCoroutine(WaitForAttackEnd(resetBool:false));
+                StartCoroutine(WaitForAttackEnd(resetBool:false, layerIndex:0, targetStateHash:0));
             }
             else
             {
-                // fallback bool: set true lalu tunggu sampai anim selesai baru reset
-                _isAttacking = true;
                 _animator.SetBool(_animIDIsAttack, true);
-                StartCoroutine(WaitForAttackEnd(resetBool:true));
+                StartCoroutine(WaitForAttackEnd(resetBool:true, layerIndex:0, targetStateHash:0));
             }
         }
 
-        private IEnumerator WaitForAttackEnd(bool resetBool)
+        private IEnumerator WaitForAttackEnd(bool resetBool, int layerIndex, int targetStateHash)
         {
-            // menunggu sampai animator selesai memainkan satu cycle state aktif di layer 0
             float timeout = 5f;
             float timer = 0f;
 
-            // tunggu agar transition ke state attack terjadi
+            // wait at least one frame for transition to begin
             yield return null;
 
-            while (timer < timeout)
+            // if we have a targetStateHash and layer, wait until that state is active
+            if (targetStateHash != 0)
             {
-                if (_animator == null) break;
-
-                var st = _animator.GetCurrentAnimatorStateInfo(0);
-
-                // jika state sedang dalam transition, terus tunggu
-                if (_animator.IsInTransition(0))
+                // wait for animator to enter the attack state on given layer
+                while (timer < timeout)
                 {
+                    if (_animator == null) break;
+                    if (!_animator.IsInTransition(layerIndex))
+                    {
+                        var st = _animator.GetCurrentAnimatorStateInfo(layerIndex);
+                        if (st.shortNameHash == targetStateHash)
+                            break;
+                    }
                     timer += Time.deltaTime;
                     yield return null;
-                    continue;
                 }
 
-                // jika normalizedTime >= 1 => satu loop selesai; berhenti
-                if (st.normalizedTime >= 1f)
-                    break;
+                // then wait full cycle of that state
+                timer = 0f;
+                while (timer < timeout)
+                {
+                    if (_animator == null) break;
+                    var st = _animator.GetCurrentAnimatorStateInfo(layerIndex);
+                    if (st.shortNameHash == targetStateHash && st.normalizedTime >= 1f)
+                        break;
+                    timer += Time.deltaTime;
+                    yield return null;
+                }
+            }
+            else
+            {
+                // fallback: wait until current state on base layer completes one cycle
+                int currentHash = 0;
+                bool entered = false;
+                timer = 0f;
 
-                timer += Time.deltaTime;
-                yield return null;
+                while (timer < timeout)
+                {
+                    if (_animator == null) break;
+                    if (_animator.IsInTransition(0))
+                    {
+                        timer += Time.deltaTime;
+                        yield return null;
+                        continue;
+                    }
+
+                    var st = _animator.GetCurrentAnimatorStateInfo(0);
+                    if (!entered)
+                    {
+                        currentHash = st.shortNameHash;
+                        entered = true;
+                    }
+                    else
+                    {
+                        if (st.shortNameHash == currentHash && st.normalizedTime >= 1f)
+                            break;
+                    }
+
+                    timer += Time.deltaTime;
+                    yield return null;
+                }
             }
 
-            // small extra buffer to ensure exit transitions can start
+            // small buffer and reset fallback bool if used
             yield return new WaitForSeconds(0.02f);
-
             if (resetBool && _animator != null)
                 _animator.SetBool(_animIDIsAttack, false);
 
+            // keep speed/motion at 0 for one frame so blend condition remains satisfied
+            if (_animator != null)
+            {
+                _animator.SetFloat(_animIDSpeed, 0f);
+                _animator.SetFloat(_animIDMotionSpeed, 0f);
+            }
+            yield return null;
             _isAttacking = false;
         }
 
